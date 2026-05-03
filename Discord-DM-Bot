@@ -1,0 +1,246 @@
+# dmall_bot.py
+# Single-file Discord bot with mass DM commands
+# .env / dotenv support completely removed
+
+import discord
+from discord.ext import commands
+import asyncio
+from datetime import datetime
+
+# ────────────────────────────────────────────────
+#  BOT SETUP
+# ────────────────────────────────────────────────
+
+intents = discord.Intents.default()
+intents.members = True           # Required for .members access
+intents.message_content = True
+
+bot = commands.Bot(
+    command_prefix='!',
+    intents=intents,
+    help_command=commands.DefaultHelpCommand(dm_help=False),
+    description="Mass DM & targeted messaging utilities (admin only)",
+    case_insensitive=True
+)
+
+# Lock to prevent overlapping DM tasks (fixes triple-send bug)
+dm_lock = asyncio.Lock()
+
+# ────────────────────────────────────────────────
+#  PUT YOUR TOKEN HERE
+# ────────────────────────────────────────────────
+TOKEN = 'PASTE_YOUR_TOKEN'   # ← Replace this with your actual token
+
+# ────────────────────────────────────────────────
+#  HELPER FUNCTIONS
+# ────────────────────────────────────────────────
+
+async def send_progress(ctx, status_msg, sent: int, failed: int, total: int, color=0x5865F2):
+    percent = (sent + failed) / total * 100 if total > 0 else 0
+    embed = discord.Embed(
+        description=(
+            f"**{sent:,}** sent  •  **{failed:,}** failed\n"
+            f"{percent:.1f}% • {total:,} total targets"
+        ),
+        color=color
+    )
+    embed.set_footer(text=f"Server: {ctx.guild.name}")
+    await status_msg.edit(embed=embed)
+
+
+async def mass_dm_task(ctx, members, message: str, delay_base: float = 1.4, jitter: bool = True):
+    # Prevent overlapping DM tasks from firing multiple sends
+    if dm_lock.locked():
+        await ctx.send("⚠️ A DM task is already running! Please wait for it to finish.")
+        return 0, 0, 0
+
+    async with dm_lock:
+        sent = failed = 0
+        total = len(members)
+
+        status = await ctx.send(embed=discord.Embed(
+            description=f"Starting... targeting **{total:,}** members",
+            color=0x2b2d31
+        ))
+
+        for i, member in enumerate(members, 1):
+            try:
+                await member.send(message)
+                sent += 1
+                print(f"[{i}/{total}] ✔ {member} ({member.id})")
+            except discord.Forbidden:
+                failed += 1
+                print(f"[{i}/{total}] ✖ {member} – DMs closed")
+            except Exception as e:
+                failed += 1
+                print(f"[{i}/{total}] ⚠ {member} – {type(e).__name__}: {e}")
+
+            # Rate limit protection
+            sleep_time = delay_base
+            if jitter and sent % 7 == 0:
+                sleep_time += 0.35
+            await asyncio.sleep(sleep_time)
+
+            # Update progress every ~12 messages
+            if i % 12 == 0 and i < total:
+                await send_progress(ctx, status, sent, failed, total)
+
+        # Final report
+        color = 0x57F287 if failed == 0 else 0xF04747 if sent == 0 else 0xFEE75C
+        final_embed = discord.Embed(
+            title="Mass DM Completed",
+            description=f"**{sent:,}** successful   •   **{failed:,}** failed",
+            color=color,
+            timestamp=datetime.utcnow()
+        )
+        final_embed.set_footer(
+            text=f"Requested by {ctx.author} • {ctx.guild.name}",
+            icon_url=ctx.author.display_avatar.url
+        )
+        await status.edit(embed=final_embed)
+
+        return sent, failed, total
+
+# ────────────────────────────────────────────────
+#  COMMANDS
+# ────────────────────────────────────────────────
+
+@bot.command(
+    name="dmall",
+    aliases=["massdm"],
+    usage="<message>",
+    brief="DM almost every non-bot member"
+)
+@commands.guild_only()
+@commands.has_permissions(administrator=True)
+@commands.cooldown(1, 900, commands.BucketType.guild)  # 15 min
+async def dmall(ctx: commands.Context, *, message: str):
+    if not message.strip():
+        return await ctx.send("You must provide a message.")
+
+    members = [m for m in ctx.guild.members if not m.bot and m != bot.user]
+    if not members:
+        return await ctx.send("No eligible members found.")
+
+    await ctx.send(f"Starting **!dmall** → {len(members):,} targets")
+    await mass_dm_task(ctx, members, message)
+
+
+@bot.command(
+    name="dmonline",
+    aliases=["dmactive"],
+    usage="<message>",
+    brief="DM only currently online members"
+)
+@commands.guild_only()
+@commands.has_permissions(administrator=True)
+@commands.cooldown(1, 600, commands.BucketType.guild)
+async def dmonline(ctx: commands.Context, *, message: str):
+    if not message.strip():
+        return await ctx.send("Message cannot be empty.")
+
+    members = [m for m in ctx.guild.members if not m.bot and m.status != discord.Status.offline]
+    if not members:
+        return await ctx.send("No non-bot members online right now.")
+
+    await ctx.send(f"Sending to **{len(members):,} online** members")
+    await mass_dm_task(ctx, members, message, delay_base=1.35)
+
+
+@bot.command(
+    name="dmrole",
+    aliases=["massdm-role"],
+    usage="<@role> <message>",
+    brief="DM everyone with a specific role"
+)
+@commands.guild_only()
+@commands.has_permissions(administrator=True)
+@commands.cooldown(1, 600, commands.BucketType.guild)
+async def dmrole(ctx: commands.Context, role: discord.Role, *, message: str):
+    if not message.strip():
+        return await ctx.send("Message cannot be empty.")
+
+    members = [m for m in role.members if not m.bot]
+    if not members:
+        return await ctx.send(f"No non-bot members have {role.mention}.")
+
+    await ctx.send(f"Targeting **{len(members):,}** members with {role.mention}")
+    await mass_dm_task(ctx, members, message, delay_base=1.38)
+
+
+@bot.command(
+    name="previewdm",
+    aliases=["dmtest", "dmfake"],
+    usage="<message>",
+    brief="Preview the DM — sends it to yourself"
+)
+@commands.guild_only()
+@commands.has_permissions(administrator=True)
+async def previewdm(ctx: commands.Context, *, message: str):
+    try:
+        embed = discord.Embed(
+            description=message,
+            color=0x2b2d31,
+            timestamp=datetime.utcnow()
+        )
+        embed.set_author(
+            name="DM Preview — what members would receive",
+            icon_url=ctx.guild.icon.url if ctx.guild.icon else None
+        )
+        embed.set_footer(text=f"From: {ctx.guild.name}")
+
+        await ctx.author.send(embed=embed)
+        await ctx.author.send(f"Plain text:\n{message}")
+
+        await ctx.send(f"{ctx.author.mention} → Preview sent to your DMs!")
+    except discord.Forbidden:
+        await ctx.send("Can't DM you — please allow DMs from server members.")
+    except Exception as e:
+        await ctx.send(f"Preview failed: {e}")
+
+
+@bot.command(
+    name="dmcount",
+    aliases=["dmtargets", "countdm"],
+    brief="Estimate how many people !dmall would reach"
+)
+@commands.guild_only()
+@commands.has_permissions(administrator=True)
+async def dmcount(ctx: commands.Context):
+    total = len(ctx.guild.members)
+    bots = sum(1 for m in ctx.guild.members if m.bot)
+    humans = total - bots
+    online = sum(1 for m in ctx.guild.members if not m.bot and m.status != discord.Status.offline)
+
+    embed = discord.Embed(title="DM Reach Estimate", color=0x5865F2)
+    embed.add_field(name="Total Members", value=f"{total:,}", inline=True)
+    embed.add_field(name="Bots", value=f"{bots:,}", inline=True)
+    embed.add_field(name="Humans", value=f"{humans:,}", inline=True)
+    embed.add_field(name="Currently Online", value=f"{online:,}", inline=False)
+    embed.set_footer(text="Actual success rate depends on DM privacy settings")
+    await ctx.send(embed=embed)
+
+
+# ────────────────────────────────────────────────
+#  EVENTS
+# ────────────────────────────────────────────────
+
+@bot.event
+async def on_ready():
+    # str(bot.user) fixes: TypeError: unsupported format string passed to ClientUser.__format__
+    print(f"┌──────────────────────────────────────┐")
+    print(f"│  Logged in as {str(bot.user):<20} │")
+    print(f"│  Servers     : {len(bot.guilds):>4,}               │")
+    print(f"│  Ready at    : {discord.utils.utcnow():%Y-%m-%d %H:%M UTC} │")
+    print(f"└──────────────────────────────────────┘")
+
+
+# ────────────────────────────────────────────────
+#  RUN
+# ────────────────────────────────────────────────
+
+if __name__ == "__main__":
+    if TOKEN == 'YOUR_BOT_TOKEN_HERE' or not TOKEN.strip():
+        print("ERROR: Please replace 'YOUR_BOT_TOKEN_HERE' with a real bot token.")
+    else:
+        bot.run(TOKEN)
